@@ -161,6 +161,16 @@ int llama_server(common_params & params, int argc, char ** argv) {
         }
     }
 
+    // resolve the total-slot budget: cold slots live on top of the hot slots, so the
+    // total can never be smaller than the number of in-flight (hot) slots
+    if (params.n_slots_total <= 0) {
+        params.n_slots_total = std::max(params.n_parallel, 1);
+    } else if (params.n_slots_total < params.n_parallel) {
+        SRV_WRN("--slots-total (%d) < --parallel (%d), clamping to --parallel\n",
+                params.n_slots_total, params.n_parallel);
+        params.n_slots_total = params.n_parallel;
+    }
+
     // size the KV pool from --kv-unified-per-slot, unless the user pinned it with -c
     // or with -c 0 for max context
     const bool ctx_pool_auto_sized = params.kv_unified_per_slot > 0 &&

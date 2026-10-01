@@ -546,3 +546,166 @@ def test_slot_restore_media_file_without_mmproj(mmproj_server):
     assert res.status_code == 200
     assert res.body["timings"]["cache_n"] == 0
     assert res.body["content"] == content
+
+
+#
+# Cold-slot offload and prompt-similarity matching (--slots-total + --slot-save-path).
+#
+# With --slots-total M > --parallel N, the disk tier holds up to M - N cold
+# entries. When all hot slots are occupied and a new prompt needs a slot, the
+# LRU warm slot is offloaded to disk instead of dropped; a later prompt matching
+# a cold entry is restored into a hot slot. Hot matches always win. Cold state is
+# observed via cold_slot_*.bin files in the save dir (no is_cold in /slots).
+#
+
+def _cold_files(path):
+    return sorted(f for f in os.listdir(path) if f.startswith("cold_slot_") and f.endswith(".bin"))
+
+
+def _run(server, prompt, **extra):
+    data = {"prompt": prompt, "cache_prompt": True, "n_predict": 4}
+    data.update(extra)
+    res = server.make_request("POST", "/completion", data=data)
+    assert res.status_code == 200
+    return res
+
+
+def test_cold_slot_offload_and_restore_round_trip():
+    global server
+    # 1 hot slot, cold budget 1; RAM prompt cache disabled so only the cold tier can provide reuse
+    server.n_slots = 1
+    server.n_slots_total = 2
+    server.cache_ram = 0
+    server.start()
+
+    prompt_a = "What is the capital of France?"
+    prompt_b = "Explain the theory of relativity in simple terms."
+
+    # A fills the only hot slot
+    res = _run(server, prompt_a)
+    assert res.body["timings"]["prompt_n"] == 21
+
+    # B does not match A: the LRU victim (A) is offloaded to disk
+    res = _run(server, prompt_b)
+    assert res.body["timings"]["prompt_n"] > 2  # B is processed from scratch
+    assert len(_cold_files(server.slot_save_path)) == 1
+
+    # A now matches the cold entry: restored into the hot slot before dispatch
+    res = _run(server, prompt_a)
+    assert res.body["timings"]["prompt_n"] <= 2  # KV was restored from disk
+
+
+def test_cold_slot_budget_evicts_oldest():
+    global server
+    # 1 hot slot, cold budget 1: each new offload must evict the oldest cold entry
+    server.n_slots = 1
+    server.n_slots_total = 2
+    server.cache_ram = 0
+    server.start()
+
+    prompt_a = "What is the capital of France?"
+    prompt_b = "Explain the theory of relativity in simple terms."
+    prompt_c = "List three good hobbies for a quiet person."
+
+    _run(server, prompt_a)  # A hot
+    _run(server, prompt_b)  # B hot, A offloaded to cold (cold id 0)
+    first_cold = _cold_files(server.slot_save_path)
+    assert len(first_cold) == 1
+
+    _run(server, prompt_c)  # C hot, B offloaded (cold id 1), budget evicts A (cold id 0)
+    cold = _cold_files(server.slot_save_path)
+    assert len(cold) == 1
+    assert cold != first_cold  # the oldest cold file was deleted and replaced
+
+    # A matches nothing now (its cold entry was dropped): fully processed
+    res = _run(server, prompt_a)
+    assert res.body["timings"]["prompt_n"] > 2
+
+
+def test_cold_slot_hot_match_takes_precedence():
+    global server
+    # 2 hot slots, cold budget 1
+    server.n_slots = 2
+    server.n_slots_total = 3
+    server.cache_ram = 0
+    server.start()
+
+    prompt_a = "What is the capital of France?"
+    prompt_b = "Explain the theory of relativity in simple terms."
+    prompt_c = "List three good hobbies for a quiet person."
+
+    _run(server, prompt_a, id_slot=0)  # A on slot 0
+    _run(server, prompt_b, id_slot=1)  # B on slot 1
+    _run(server, prompt_c)             # LRU victim is slot 0 (A) -> A goes cold
+
+    assert len(_cold_files(server.slot_save_path)) == 1
+
+    # put A hot on slot 1 as well
+    _run(server, prompt_a, id_slot=1)
+
+    # A now matches hot slot 1 and a cold entry: the hot slot must win and the
+    # cold entry must survive untouched (no restore, no file deletion)
+    res = _run(server, prompt_a)
+    assert res.body["timings"]["prompt_n"] <= 2
+    assert len(_cold_files(server.slot_save_path)) == 1
+
+
+def test_cold_slot_parallelism_unaffected():
+    global server
+    # 2 hot slots, cold budget 1
+    server.n_slots = 2
+    server.n_slots_total = 3
+    server.cache_ram = 0
+    server.start()
+
+    prompt_a = "What is the capital of France?"
+    prompt_b = "Explain the theory of relativity in simple terms."
+    prompt_c = "List three good hobbies for a quiet person."
+
+    # create a cold entry
+    _run(server, prompt_a, id_slot=0)
+    _run(server, prompt_b, id_slot=1)
+    _run(server, prompt_c)
+
+    # two concurrent requests still run on the hot slots and complete
+    results = parallel_function_calls([
+        (server.make_request, ("POST", "/completion", {"prompt": prompt_b, "cache_prompt": True, "n_predict": 8})),
+        (server.make_request, ("POST", "/completion", {"prompt": prompt_c, "cache_prompt": True, "n_predict": 8})),
+    ])
+    for res in results:
+        assert res.status_code == 200
+        assert "content" in res.body
+
+    # a third concurrent request exceeds the hot budget but still completes (deferred, not dropped)
+    results = parallel_function_calls([
+        (server.make_request, ("POST", "/completion", {"prompt": prompt_a, "cache_prompt": True, "n_predict": 8})),
+        (server.make_request, ("POST", "/completion", {"prompt": prompt_b, "cache_prompt": True, "n_predict": 8})),
+        (server.make_request, ("POST", "/completion", {"prompt": prompt_c, "cache_prompt": True, "n_predict": 8})),
+    ])
+    for res in results:
+        assert res.status_code == 200
+        assert "content" in res.body
+
+
+def test_cold_slot_registry_size_is_parallel():
+    global server
+    # registry must list exactly n_parallel slots regardless of --slots-total
+    server.n_slots = 2
+    server.n_slots_total = 5
+    server.server_slots = True
+    server.cache_ram = 0
+    server.start()
+
+    prompt_a = "What is the capital of France?"
+    prompt_b = "Explain the theory of relativity in simple terms."
+    prompt_c = "List three good hobbies for a quiet person."
+
+    _run(server, prompt_a)
+    _run(server, prompt_b)
+    _run(server, prompt_c)  # forces an offload to cold
+
+    res = server.make_request("GET", "/slots")
+    assert res.status_code == 200
+    assert len(res.body) == 2
+    assert sorted(s["id"] for s in res.body) == [0, 1]
+    assert "is_cold" not in res.body[0]

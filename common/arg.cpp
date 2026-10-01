@@ -2543,7 +2543,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         // this is to make sure this option appears in the server-specific section of the help message
         add_opt(common_arg(
             {"-np", "--parallel"}, "N",
-            string_format("number of server slots (default: %d, -1 = auto)", params.n_parallel),
+            string_format("number of VRAM-resident parallel (hot) server slots (default: %d, -1 = auto)", params.n_parallel),
             [](common_params & params, int value) {
                 if (value == 0) {
                     throw std::invalid_argument("error: invalid value for n_parallel\n");
@@ -2551,6 +2551,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                 params.n_parallel = value;
             }
         ).set_env("LLAMA_ARG_N_PARALLEL").set_examples({LLAMA_EXAMPLE_SERVER}));
+        add_opt(common_arg(
+            {"--slots-total"}, "N",
+            string_format("total number of slots, including cold slots offloaded to disk; cold budget = slots-total minus parallel (default: same as --parallel)", params.n_slots_total),
+            [](common_params & params, int value) {
+                if (value <= 0) {
+                    throw std::invalid_argument("error: invalid value for n_slots_total\n");
+                }
+                params.n_slots_total = value;
+            }
+        ).set_env("LLAMA_ARG_SLOTS_TOTAL").set_examples({LLAMA_EXAMPLE_SERVER}));
     } else {
         add_opt(common_arg(
             {"-np", "--parallel"}, "N",

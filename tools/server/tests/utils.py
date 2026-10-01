@@ -78,6 +78,8 @@ class ServerProcess:
     id_slot: int | None = None
     cache_prompt: bool | None = None
     n_slots: int | None = None
+    n_slots_total: int | None = None
+    slot_prompt_similarity: float | None = None
     ctk: str | None = None
     ctv: str | None = None
     fa: str | None = None
@@ -217,6 +219,10 @@ class ServerProcess:
             server_args.extend(["--ctx-size", self.n_ctx])
         if self.n_slots:
             server_args.extend(["--parallel", self.n_slots])
+        if self.n_slots_total:
+            server_args.extend(["--slots-total", self.n_slots_total])
+        if self.slot_prompt_similarity is not None:
+            server_args.extend(["--slot-prompt-similarity", self.slot_prompt_similarity])
         if self.ctk:
             server_args.extend(["-ctk", self.ctk])
         if self.ctv:
