@@ -116,6 +116,21 @@ vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
 }
 #endif
 
+#if defined(DATA_A_Q6_0)
+vec2 dequantize(uint ib, uint iqs, uint a_offset) {
+    const uint h = uint(data_a[a_offset + ib].qh[iqs % 8u]) >> (4u * (iqs / 8u));
+    const uint q = uint(data_a[a_offset + ib].qs[iqs]);
+    return vec2(
+        (q & 0x0fu) | ((h & 0x03u) << 4u),
+        (q >> 4u)   | ((h & 0x0cu) << 2u));
+}
+vec4 dequantize4(uint ib, uint iqs, uint a_offset) {
+    const vec2 a = dequantize(ib, iqs, a_offset);
+    const vec2 b = dequantize(ib, iqs + 1u, a_offset);
+    return vec4(a.x, a.y, b.x, b.y);
+}
+#endif
+
 #if defined(DATA_A_Q8_0)
 vec2 dequantize(uint ib, uint iqs, uint a_offset) {
     return vec2(int(data_a[a_offset + ib].qs[iqs]), int(data_a[a_offset + ib].qs[iqs + 1]));
@@ -562,6 +577,12 @@ vec2 get_dm(uint ib, uint a_offset) {
 #if defined(DATA_A_Q2_0) || defined(DATA_A_Q4_0) || defined(DATA_A_Q5_0) || defined(DATA_A_Q8_0) || defined(DATA_A_IQ1_S) || defined(DATA_A_IQ2_XXS) || defined(DATA_A_IQ2_XS) || defined(DATA_A_IQ2_S) || defined(DATA_A_IQ3_XXS) || defined(DATA_A_IQ3_S) || defined(DATA_A_IQ4_XS) || defined(DATA_A_IQ4_NL)
 vec2 get_dm(uint ib, uint a_offset) {
     return vec2(float(data_a[a_offset + ib].d), 0);
+}
+#endif
+
+#if defined(DATA_A_Q6_0)
+vec2 get_dm(uint ib, uint a_offset) {
+    return vec2(float(data_a[a_offset + ib].d), -32.0f*float(data_a[a_offset + ib].d));
 }
 #endif
 

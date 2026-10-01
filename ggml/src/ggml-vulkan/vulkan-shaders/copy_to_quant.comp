@@ -160,6 +160,40 @@ void quantize(uint dst_idx, uint src_idx)
 }
 #endif
 
+#if defined(DATA_A_Q6_0)
+void quantize(uint dst_idx, uint src_idx)
+{
+    float amax = 0.0;
+    float vmax = 0.0;
+    [[unroll]] for (int j = 0; j < QUANT_K_Q6_0; ++j) {
+        const float v = data_s[src_idx + j];
+        if (amax < abs(v)) { amax = abs(v); vmax = v; }
+    }
+
+    float d = vmax / -32.0;
+    const float id = d != 0.0 ? 1.0/d : 0.0;
+    float sumqx = 0.0;
+    float sumq2 = 0.0;
+    [[unroll]] for (int j = 0; j < 8; ++j) data_q[dst_idx].qh[j] = uint8_t(0);
+    [[unroll]] for (int j = 0; j < QUANT_K_Q6_0/2; ++j) {
+        const float x0 = float(data_s[src_idx + j]);
+        const float x1 = float(data_s[src_idx + QUANT_K_Q6_0/2 + j]);
+        const uint xi0 = uint(clamp(int(x0 * id + 32.5), 0, 63));
+        const uint xi1 = uint(clamp(int(x1 * id + 32.5), 0, 63));
+        data_q[dst_idx].qs[j] = uint8_t((xi0 & 0x0fu) | ((xi1 & 0x0fu) << 4));
+        const uint h = (xi0 >> 4) | ((xi1 >> 4) << 2);
+        data_q[dst_idx].qh[j % 8] |= uint8_t(h << (4*(j/8)));
+        const float v0 = float(int(xi0) - 32);
+        const float v1 = float(int(xi1) - 32);
+        const float w0 = x0*x0;
+        const float w1 = x1*x1;
+        sumqx += w0*v0*x0 + w1*v1*x1;
+        sumq2 += w0*v0*v0 + w1*v1*v1;
+    }
+    data_q[dst_idx].d = float16_t(sumq2 > 0.0 ? sumqx/sumq2 : d);
+}
+#endif
+
 #if defined(DATA_A_Q8_0)
 void quantize(uint dst_idx, uint src_idx)
 {

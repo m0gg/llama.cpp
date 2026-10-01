@@ -515,6 +515,9 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     if (s == "q5_1") {
         return GGML_TYPE_Q5_1;
     }
+    if (s == "q6_0") {
+        return GGML_TYPE_Q6_0;
+    }
     if (s == "iq4_nl") {
         return GGML_TYPE_IQ4_NL;
     }

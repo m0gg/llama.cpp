@@ -27,6 +27,8 @@ layout (binding = 1) readonly buffer K_PACKED_Q5_1 { block_q5_1_packed16 data[];
 layout (binding = 2) readonly buffer V_PACKED_Q5_1 { block_q5_1_packed16 data[]; } v_packed_q5_1;
 layout (binding = 1) readonly buffer K_PACKED_Q8_0 { block_q8_0_packed16 data[]; } k_packed_q8_0;
 layout (binding = 2) readonly buffer V_PACKED_Q8_0 { block_q8_0_packed16 data[]; } v_packed_q8_0;
+layout (binding = 1) readonly buffer K_PACKED_Q6_0 { block_q6_0 data[]; } k_packed_q6_0;
+layout (binding = 2) readonly buffer V_PACKED_Q6_0 { block_q6_0 data[]; } v_packed_q6_0;
 layout (binding = 1) readonly buffer K_PACKED_IQ4_NL { block_iq4_nl_packed16 data[]; } k_packed_iq4_nl;
 layout (binding = 2) readonly buffer V_PACKED_IQ4_NL { block_iq4_nl_packed16 data[]; } v_packed_iq4_nl;
 
@@ -104,6 +106,20 @@ layout (binding = 1) readonly buffer K_PACKED_Q5_1_P32 { block_q5_1_packed32 dat
     return FLOAT_TYPE(BUF.data[a_offset + ib].d) * FLOAT_TYPEV4(v0.x, v0.y, v1.x, v1.y);          \
 }
 
+#define FA_Q6_0_VALUE(BUF, IDX) (                                                                 \
+    FLOAT_TYPE(((IDX) < 16u) ?                                                                    \
+        ((uint(BUF.data[a_offset + ib].qs[(IDX)]) & 0x0fu) |                                      \
+         ((uint(BUF.data[a_offset + ib].qh[(IDX) & 7u]) >> (4u * ((IDX) >> 3u)) & 0x03u) << 4u)) : \
+        ((uint(BUF.data[a_offset + ib].qs[(IDX) - 16u]) >> 4u) |                                  \
+         ((uint(BUF.data[a_offset + ib].qh[((IDX) - 16u) & 7u]) >>                                \
+             (4u * (((IDX) - 16u) >> 3u)) & 0x0cu) << 2u))) - FLOAT_TYPE(32.0f))
+
+#define FA_DEQUANT4_Q6_0(BUF) {                                                                   \
+    const FLOAT_TYPE d = FLOAT_TYPE(BUF.data[a_offset + ib].d);                                    \
+    return d * FLOAT_TYPEV4(FA_Q6_0_VALUE(BUF, iqs), FA_Q6_0_VALUE(BUF, iqs + 1u),                \
+                            FA_Q6_0_VALUE(BUF, iqs + 2u), FA_Q6_0_VALUE(BUF, iqs + 3u));          \
+}
+
 #define FA_DEQUANT4_IQ4_NL(BUF) {                                                                 \
     const uint shift = (iqs & 0x10) >> 2;                                                         \
     const uint qs_i = (iqs & 0xC) >> 1;                                                           \
@@ -127,6 +143,7 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
             case GGML_TYPE_Q5_0: FA_DEQUANT4_Q5_0(k_packed_q5_0)
             case GGML_TYPE_Q5_1: FA_DEQUANT4_Q5_1(k_packed_q5_1)
             case GGML_TYPE_Q8_0: FA_DEQUANT4_Q8_0(k_packed_q8_0)
+            case GGML_TYPE_Q6_0: FA_DEQUANT4_Q6_0(k_packed_q6_0)
             case GGML_TYPE_IQ4_NL: FA_DEQUANT4_IQ4_NL(k_packed_iq4_nl)
             case GGML_TYPE_BF16: FA_DEQUANT4_BF16(k_packed_bf16)
         }
@@ -138,6 +155,7 @@ FLOAT_TYPEV4 dequantize4(uint ib, uint iqs, uint a_offset, uint binding_idx) {
             case GGML_TYPE_Q5_0: FA_DEQUANT4_Q5_0(v_packed_q5_0)
             case GGML_TYPE_Q5_1: FA_DEQUANT4_Q5_1(v_packed_q5_1)
             case GGML_TYPE_Q8_0: FA_DEQUANT4_Q8_0(v_packed_q8_0)
+            case GGML_TYPE_Q6_0: FA_DEQUANT4_Q6_0(v_packed_q6_0)
             case GGML_TYPE_IQ4_NL: FA_DEQUANT4_IQ4_NL(v_packed_iq4_nl)
             case GGML_TYPE_BF16: FA_DEQUANT4_BF16(v_packed_bf16)
         }

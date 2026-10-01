@@ -172,6 +172,24 @@ struct block_q5_1_packed32
 #define DATA_A_QUANT_LEGACY
 #endif
 
+#define QUANT_K_Q6_0 32
+#define QUANT_R_Q6_0 2
+
+struct block_q6_0
+{
+    float16_t d;
+    uint8_t qh[8];
+    uint8_t qs[16];
+};
+
+#if defined(DATA_A_Q6_0)
+#define QUANT_K QUANT_K_Q6_0
+#define QUANT_R QUANT_R_Q6_0
+#define QUANT_AUXF 1
+#define A_TYPE block_q6_0
+#define DATA_A_QUANT_LEGACY
+#endif
+
 #define QUANT_K_Q8_0 32
 #define QUANT_R_Q8_0 1
 
