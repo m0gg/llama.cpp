@@ -173,7 +173,8 @@ For the full list of features, please refer to [server's changelog](https://gith
 | `--warmup, --no-warmup` | whether to perform warmup with an empty run (default: enabled) |
 | `--spm-infill` | use Suffix/Prefix/Middle pattern for infill (instead of Prefix/Suffix/Middle) as some models prefer this. (default: disabled) |
 | `--pooling {none,mean,cls,last,rank}` | pooling type for embeddings, use model default if unspecified<br/>(env: LLAMA_ARG_POOLING) |
-| `-np, --parallel N` | number of server slots (default: -1, -1 = auto)<br/>(env: LLAMA_ARG_N_PARALLEL) |
+| `-np, --parallel N` | number of VRAM-resident parallel (hot) server slots (default: -1, -1 = auto)<br/>(env: LLAMA_ARG_N_PARALLEL) |
+| `--slots-total N` | total number of slots, including cold slots offloaded to disk; cold budget = slots-total minus parallel (default: same as --parallel)<br/>(env: LLAMA_ARG_SLOTS_TOTAL) |
 | `-cb, --cont-batching, -nocb, --no-cont-batching` | whether to enable continuous batching (a.k.a dynamic batching) (default: enabled)<br/>(env: LLAMA_ARG_CONT_BATCHING) |
 | `-mm, --mmproj FILE` | path to a multimodal projector file. see tools/mtmd/README.md<br/>note: if -hf is used, this argument can be omitted<br/>(env: LLAMA_ARG_MMPROJ) |
 | `-mmu, --mmproj-url URL` | URL to a multimodal projector file. see tools/mtmd/README.md<br/>(env: LLAMA_ARG_MMPROJ_URL) |
@@ -1195,6 +1196,16 @@ In *router mode* the query param `?model={model_id}` has to be set. This endpoin
     "n_erased": 1745
 }
 ```
+
+`-np, --parallel` sets the number of VRAM-resident (hot) slots; each holds one prompt's KV state.
+`--slots-total` (default: same as `--parallel`) sets the total budget of hot + cold slots, so the disk
+tier holds at most `slots-total - parallel` entries. When a new prompt needs a slot and all hot slots
+are occupied, the LRU warm slot is offloaded to disk as a new cold entry (`cold_slot_<cold_id>.bin` in
+`--slot-save-path`) instead of being dropped; when the cold list exceeds its budget, the oldest cold
+entry is dropped and its file deleted. Prompt-similarity matching checks hot slots first (a hot match
+always wins) and then cold entries; a cold match is restored into an empty hot slot, or by offloading
+the LRU warm slot first. With the default `--slots-total` equal to `--parallel` there is no disk tier
+and no offload IO happens.
 
 ### GET `/lora-adapters`: Get list of all LoRA adapters
 

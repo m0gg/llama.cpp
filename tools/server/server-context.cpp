@@ -887,6 +887,17 @@ private:
     // slots / clients
     std::vector<server_slot> slots;
 
+    // cold slots: KV state offloaded to disk, not tied to any hot slot id
+    struct cold_slot {
+        int           id;
+        std::string   filepath;
+        server_tokens prompt;
+        int64_t       t_last_used;
+    };
+
+    std::vector<cold_slot> cold_slots;
+    int next_cold_id = 0;
+
     int trace = 0;        // env: LLAMA_TRACE
     int slots_debug = 0;  // env: LLAMA_SERVER_SLOTS_DEBUG
     int slots_n_diff = 0; // env: LLAMA_SERVER_SLOTS_N_DIFF
@@ -1228,10 +1239,11 @@ private:
         }
 
         // setup slots
-        SRV_INF("initializing, n_slots = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
-                params_base.n_parallel, n_ctx_slot(), params_base.kv_unified ? "true" : "false");
+        SRV_INF("initializing, n_slots = %d (hot), cold budget = %d, n_ctx_slot = %d, kv_unified = '%s'\n",
+                params_base.n_parallel, cold_budget(), n_ctx_slot(), params_base.kv_unified ? "true" : "false");
 
-        // initialize slots
+        // initialize slots - the registry holds only the hot slots; cold state lives
+        // in a separate disk-backed list on server_context, not tied to slot ids
         for (int i = 0; i < params_base.n_parallel; i++) {
             slots.emplace_back();
         }
@@ -1525,10 +1537,153 @@ private:
         return nullptr;
     }
 
+    // number of cold (disk) slots allowed on top of the hot slots
+    int cold_budget() const {
+        return std::max(0, params_base.n_slots_total - params_base.n_parallel);
+    }
+
+    bool cold_enabled() const {
+        return !params_base.slot_save_path.empty() && cold_budget() > 0;
+    }
+
+    // offload a hot slot's KV state to disk as a new cold entry and clear the slot
+    // returns false if the state could not be written (slot is left untouched)
+    bool cold_offload_slot(server_slot & slot) {
+        if (slot.prompt.tokens.empty()) {
+            return false;
+        }
+
+        std::vector<char> packed;
+        try {
+            packed = slot.prompt.tokens.serialize();
+        } catch (const std::exception & err) {
+            SLT_WRN(slot, "failed to serialize prompt for offload: %s\n", err.what());
+            return false;
+        }
+
+        GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
+
+        cold_slot entry;
+        entry.id           = next_cold_id++;
+        entry.filepath     = params_base.slot_save_path + "cold_slot_" + std::to_string(entry.id) + ".bin";
+        entry.t_last_used  = slot.t_last_used;
+
+        const size_t nwrite = llama_state_seq_save_file(
+            ctx_tgt, entry.filepath.c_str(), slot.id,
+            reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
+        if (nwrite == 0) {
+            SLT_WRN(slot, "failed to write cold slot state to %s\n", entry.filepath.c_str());
+            return false;
+        }
+
+        SLT_INF(slot, "offloaded prompt with %zu tokens to %s (cold id %d)\n",
+                slot.prompt.tokens.size(), entry.filepath.c_str(), entry.id);
+
+        entry.prompt = slot.prompt.tokens.clone();
+        cold_slots.push_back(std::move(entry));
+
+        if (prompt_cache) {
+            slot.prompt_save(*prompt_cache);
+        }
+        slot.prompt_clear();
+
+        cold_enforce_budget();
+
+        return true;
+    }
+
+    // drop the oldest cold entries until the list fits the cold budget, deleting their files
+    void cold_enforce_budget() {
+        const int budget = cold_budget();
+
+        while ((int) cold_slots.size() > budget) {
+            auto oldest = cold_slots.begin();
+            for (auto it = cold_slots.begin(); it != cold_slots.end(); ++it) {
+                if (it->t_last_used < oldest->t_last_used
+                        || (it->t_last_used == oldest->t_last_used && it->id < oldest->id)) {
+                    oldest = it;
+                }
+            }
+
+            SRV_INF("cold slot budget %d exceeded, dropping cold id %d (t_last_used = %" PRId64 "): %s\n",
+                    budget, oldest->id, oldest->t_last_used, oldest->filepath.c_str());
+
+            std::error_code ec;
+            std::filesystem::remove(oldest->filepath, ec);
+            if (ec) {
+                SRV_WRN("failed to delete cold slot file %s: %s\n", oldest->filepath.c_str(), ec.message().c_str());
+            }
+
+            cold_slots.erase(oldest);
+        }
+    }
+
+    // load a cold entry's KV state into the target slot (remapped to its seq id)
+    // the caller is responsible for removing the entry from the list
+    bool cold_restore_entry(server_slot & slot, const cold_slot & entry) {
+        slot.prompt_clear();
+
+        try {
+            size_t n_packed = 0;
+            size_t nread = llama_state_seq_load_file(ctx_tgt, entry.filepath.c_str(), slot.id, nullptr, 0, &n_packed);
+            if (nread == 0) {
+                throw std::runtime_error("no space in KV cache or invalid cold slot file");
+            }
+
+            llama_tokens packed;
+            packed.resize(std::max<size_t>(1, n_packed));
+            nread = llama_state_seq_load_file(ctx_tgt, entry.filepath.c_str(), slot.id, packed.data(), packed.size(), &n_packed);
+            if (nread == 0) {
+                throw std::runtime_error("failed to read cold slot state");
+            }
+            packed.resize(n_packed);
+
+            server_tokens restored = server_tokens::deserialize(packed, entry.prompt.has_mtmd);
+
+            if (restored.size() > (size_t) slot.n_ctx) {
+                throw std::runtime_error("restored prompt does not fit in the slot context");
+            }
+
+            if (!restored.validate(ctx_tgt)) {
+                throw std::runtime_error("invalid tokens in cold slot file");
+            }
+
+            slot.prompt.clear();
+            slot.prompt.tokens = std::move(restored);
+        } catch (const std::exception & err) {
+            SLT_WRN(slot, "failed to restore cold slot: %s\n", err.what());
+            slot.prompt_clear();
+            return false;
+        }
+
+        SLT_INF(slot, "restored cold id %d with %zu tokens from %s\n",
+                entry.id, slot.prompt.tokens.size(), entry.filepath.c_str());
+
+        return true;
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
         bool update_cache = false;
+
+        // hot-slot budget: only n_parallel slots may be in-flight at once; when full,
+        // the task is deferred by the caller until a slot frees up
+        {
+            int n_hot = 0;
+            for (const auto & slot : slots) {
+                if (slot.is_processing()) {
+                    n_hot++;
+                }
+            }
+            if (n_hot >= params_base.n_parallel) {
+                return nullptr;
+            }
+        }
+
+        // cold tier is only considered when a hot slot is free, so this never blocks
+        // or reorders in-flight hot-slot parallel requests
+        const bool cold_on = cold_enabled();
 
         // if a specific slot is requested, use it (still goes through cache update logic below)
         if (task.id_slot != -1) {
@@ -1590,7 +1745,83 @@ private:
             }
         }
 
-        // find the slot that has been least recently used
+        // no hot slot matched by similarity - scan cold (disk-offloaded) entries with
+        // the same LCP metric; a hot match above always takes precedence over a cold one
+        if (ret == nullptr && cold_on && slot_prompt_similarity != 0.0f) {
+            float f_sim_best = 0;
+            size_t idx_best = cold_slots.size();
+
+            for (size_t i = 0; i < cold_slots.size(); i++) {
+                const size_t lcp_len = cold_slots[i].prompt.get_common_prefix(task.tokens);
+                const float f_sim_cur = float(lcp_len) / task.tokens.size();
+
+                SRV_TRC(" - checking cold sim = %.3f (%zu/%zu) > %.3f (cold id %d)\n",
+                        f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity, cold_slots[i].id);
+
+                if (f_sim_cur > f_sim_best && f_sim_cur > slot_prompt_similarity) {
+                    f_sim_best = f_sim_cur;
+                    idx_best = i;
+                }
+            }
+
+            if (idx_best < cold_slots.size()) {
+                // pick the target hot slot: prefer an empty slot, else the LRU warm idle slot
+                server_slot * target = nullptr;
+
+                for (server_slot & slot : slots) {
+                    if (!slot.is_processing() && slot.prompt.tokens.empty()) {
+                        target = &slot;
+                        break;
+                    }
+                }
+
+                if (target == nullptr) {
+                    int64_t t_last = -1;
+                    for (server_slot & slot : slots) {
+                        if (slot.is_processing()) {
+                            continue;
+                        }
+                        if (!target || slot.t_last_used < t_last) {
+                            t_last = slot.t_last_used;
+                            target = &slot;
+                        }
+                    }
+                }
+
+                if (target != nullptr) {
+                    // move the entry out and erase it before the victim offload below,
+                    // so the budget math does not count the entry being consumed
+                    cold_slot entry = std::move(cold_slots[idx_best]);
+                    cold_slots.erase(cold_slots.begin() + idx_best);
+
+                    SLT_INF(*target, "selected cold id %d by LCP similarity, f_sim_best = %.3f (> %.3f thold)\n",
+                            entry.id, f_sim_best, slot_prompt_similarity);
+
+                    // the target may hold a warm prompt - offload it to disk first
+                    if (!target->prompt.tokens.empty()) {
+                        cold_offload_slot(*target);
+                    }
+
+                    if (cold_restore_entry(*target, entry)) {
+                        // the entry is consumed by the restore - its file is no longer referenced
+                        std::error_code ec;
+                        std::filesystem::remove(entry.filepath, ec);
+
+                        // the restored KV is exactly the desired state - skip the RAM
+                        // cache update below (update_cache stays false on this path)
+                        ret = target;
+                    } else {
+                        SRV_WRN("%s", "cold slot match discarded, failed to load state\n");
+                        std::error_code ec;
+                        std::filesystem::remove(entry.filepath, ec);
+                    }
+                }
+            }
+        }
+
+        // no match: pick the LRU victim among the hot slots. empty slots sort first
+        // (t_last_used == -1), then the warm slot used longest ago; ties break by the
+        // lowest slot id, making the victim deterministic
         if (ret == nullptr) {
             int64_t t_last = -1;
 
@@ -1601,7 +1832,7 @@ private:
                 }
 
                 // select the current slot if the criteria match
-                if (!ret || slot.t_last_used <= t_last) {
+                if (!ret || slot.t_last_used < t_last) {
                     t_last = slot.t_last_used;
                     ret = &slot;
                 }
@@ -1609,6 +1840,12 @@ private:
 
             if (ret != nullptr) {
                 SLT_INF(*ret, "selected slot by LRU, t_last = %" PRId64 "\n", t_last);
+
+                // a warm victim is offloaded to disk instead of dropped, so a future
+                // matching prompt can be restored from cold; an empty victim is reused as-is
+                if (cold_on && !ret->prompt.tokens.empty()) {
+                    cold_offload_slot(*ret);
+                }
 
                 update_cache = true;
             }
