@@ -892,6 +892,7 @@ private:
         int           id;
         std::string   filepath;
         server_tokens prompt;
+        size_t        ckpt_offset = 0; // checkpoint trailer in the file, 0 if none
         int64_t       t_last_used;
     };
 
@@ -1546,6 +1547,41 @@ private:
         return !params_base.slot_save_path.empty() && cold_budget() > 0;
     }
 
+    // checkpoint trailer helpers - same-process format, native endianness
+    static void write_u32(std::ostream & os, uint32_t v) { os.write((const char *) &v, 4); }
+    static void write_i32(std::ostream & os, int32_t v) { os.write((const char *) &v, 4); }
+    static void write_i64(std::ostream & os, int64_t v) { os.write((const char *) &v, 8); }
+
+    static void write_chunk(std::ostream & os, const std::vector<uint8_t> & data) {
+        write_u32(os, (uint32_t) data.size());
+        os.write((const char *) data.data(), data.size());
+    }
+
+    static uint32_t read_u32(std::istream & is) {
+        uint32_t v = 0;
+        is.read((char *) &v, 4);
+        return v;
+    }
+
+    static int32_t read_i32(std::istream & is) {
+        int32_t v = 0;
+        is.read((char *) &v, 4);
+        return v;
+    }
+
+    static int64_t read_i64(std::istream & is) {
+        int64_t v = 0;
+        is.read((char *) &v, 8);
+        return v;
+    }
+
+    static void read_chunk(std::istream & is, std::vector<uint8_t> & data) {
+        data.resize(read_u32(is));
+        if (!data.empty()) {
+            is.read((char *) data.data(), data.size());
+        }
+    }
+
     // offload a hot slot's KV state to disk as a new cold entry and clear the slot
     // returns false if the state could not be written (slot is left untouched)
     bool cold_offload_slot(server_slot & slot) {
@@ -1574,6 +1610,31 @@ private:
         if (nwrite == 0) {
             SLT_WRN(slot, "failed to write cold slot state to %s\n", entry.filepath.c_str());
             return false;
+        }
+
+        // append the checkpoint trailer so a SWA slot can resume from a checkpoint after restore
+        if (!slot.prompt.checkpoints.empty()) {
+            std::ofstream file(entry.filepath, std::ios::binary | std::ios::app);
+            if (!file) {
+                SLT_WRN(slot, "failed to append checkpoint trailer to %s\n", entry.filepath.c_str());
+            } else {
+                write_u32(file, (uint32_t) slot.prompt.checkpoints.size());
+                for (const auto & ckpt : slot.prompt.checkpoints) {
+                    write_i64(file, ckpt.n_tokens);
+                    write_i32(file, ckpt.id_task);
+                    write_i32(file, ckpt.pos_min);
+                    write_i32(file, ckpt.pos_max);
+                    write_chunk(file, ckpt.data_tgt);
+                    write_chunk(file, ckpt.data_dft);
+                    write_chunk(file, ckpt.data_spec);
+                }
+
+                if (file) {
+                    entry.ckpt_offset = nwrite;
+                } else {
+                    SLT_WRN(slot, "failed to write checkpoint trailer to %s\n", entry.filepath.c_str());
+                }
+            }
         }
 
         SLT_INF(slot, "offloaded prompt with %zu tokens to %s (cold id %d)\n",
@@ -1650,6 +1711,34 @@ private:
 
             slot.prompt.clear();
             slot.prompt.tokens = std::move(restored);
+
+            if (entry.ckpt_offset > 0) {
+                std::ifstream file(entry.filepath, std::ios::binary);
+                if (!file) {
+                    throw std::runtime_error("failed to reopen cold slot file for checkpoints");
+                }
+
+                file.seekg(entry.ckpt_offset);
+                const uint32_t n_ckpt = read_u32(file);
+
+                for (uint32_t i = 0; i < n_ckpt; i++) {
+                    common_prompt_checkpoint ckpt;
+                    ckpt.n_tokens = read_i64(file);
+                    ckpt.id_task  = read_i32(file);
+                    ckpt.pos_min  = read_i32(file);
+                    ckpt.pos_max  = read_i32(file);
+                    read_chunk(file, ckpt.data_tgt);
+                    read_chunk(file, ckpt.data_dft);
+                    read_chunk(file, ckpt.data_spec);
+                    slot.prompt.checkpoints.push_back(std::move(ckpt));
+                }
+
+                if (!file) {
+                    throw std::runtime_error("corrupted checkpoint trailer in cold slot file");
+                }
+
+                SLT_INF(slot, "restored %u checkpoint(s) for cold id %d\n", n_ckpt, entry.id);
+            }
         } catch (const std::exception & err) {
             SLT_WRN(slot, "failed to restore cold slot: %s\n", err.what());
             slot.prompt_clear();
