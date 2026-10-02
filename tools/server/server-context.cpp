@@ -268,14 +268,18 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
-        if (cur == nullptr) {
+        auto cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
+        if (cur == prompt_cache.states.end()) {
             return false;
         }
 
         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         if (ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        }
+
+        if (cur->pending_spill) {
+            prompt_cache.spill(cur);
         }
 
         return true;
@@ -892,7 +896,6 @@ private:
         int           id;
         std::string   filepath;
         server_tokens prompt;
-        size_t        ckpt_offset = 0; // checkpoint trailer in the file, 0 if none
         int64_t       t_last_used;
     };
 
@@ -1351,6 +1354,18 @@ private:
             SRV_TRC("%s", "use `--cache-ram 0` to disable the prompt cache\n");
 
             prompt_cache = std::make_unique<server_prompt_cache>(params_base.cache_ram_mib, n_ctx);
+
+            if (params_base.cold_spill_min_fraction > params_base.cold_spill_fraction) {
+                SRV_WRN("cold spill min fraction %.2f exceeds spill fraction %.2f, clamping\n",
+                        (double) params_base.cold_spill_min_fraction, (double) params_base.cold_spill_fraction);
+                params_base.cold_spill_min_fraction = params_base.cold_spill_fraction;
+            }
+
+            prompt_cache->spill_fraction = params_base.cold_spill_fraction;
+            prompt_cache->min_fraction   = params_base.cold_spill_min_fraction;
+            prompt_cache->on_evict = [this](const server_prompt_cache_state & state) {
+                return cold_write_record(state);
+            };
         } else {
             SRV_TRC("%s", "prompt cache is disabled - use `--cache-ram N` to enable it\n");
         }
@@ -1547,14 +1562,24 @@ private:
         return !params_base.slot_save_path.empty() && cold_budget() > 0;
     }
 
-    // checkpoint trailer helpers - same-process format, native endianness
+    // cold record format helpers - same-process format, native endianness
+    static size_t checkpoints_size(const server_prompt & prompt) {
+        size_t res = 0;
+        for (const auto & ckpt : prompt.checkpoints) {
+            res += ckpt.size();
+        }
+        return res;
+    }
+
     static void write_u32(std::ostream & os, uint32_t v) { os.write((const char *) &v, 4); }
     static void write_i32(std::ostream & os, int32_t v) { os.write((const char *) &v, 4); }
     static void write_i64(std::ostream & os, int64_t v) { os.write((const char *) &v, 8); }
 
     static void write_chunk(std::ostream & os, const std::vector<uint8_t> & data) {
         write_u32(os, (uint32_t) data.size());
-        os.write((const char *) data.data(), data.size());
+        if (!data.empty()) {
+            os.write((const char *) data.data(), data.size());
+        }
     }
 
     static uint32_t read_u32(std::istream & is) {
@@ -1582,75 +1607,98 @@ private:
         }
     }
 
-    // offload a hot slot's KV state to disk as a new cold entry and clear the slot
-    // returns false if the state could not be written (slot is left untouched)
+    // write a cold slot record: tokens, state chunks, checkpoint chunks
+    bool cold_write_record(const server_prompt_cache_state & state) {
+        if (!cold_enabled()) {
+            return false;
+        }
+
+        cold_slot entry;
+        entry.id          = next_cold_id++;
+        entry.filepath    = params_base.slot_save_path + "cold_slot_" + std::to_string(entry.id) + ".bin";
+        entry.t_last_used = ggml_time_us();
+
+        std::ofstream file(entry.filepath, std::ios::binary);
+        if (!file) {
+            SRV_WRN("failed to open cold slot file for writing: %s\n", entry.filepath.c_str());
+            return false;
+        }
+
+        const llama_tokens & tokens = state.prompt.tokens.get_tokens();
+        write_u32(file, (uint32_t) tokens.size());
+        for (const llama_token t : tokens) {
+            write_i32(file, t);
+        }
+
+        write_chunk(file, state.data.main);
+        write_chunk(file, state.data.drft);
+
+        write_u32(file, (uint32_t) state.prompt.checkpoints.size());
+        for (const auto & ckpt : state.prompt.checkpoints) {
+            write_i64(file, ckpt.n_tokens);
+            write_i32(file, ckpt.id_task);
+            write_i32(file, ckpt.pos_min);
+            write_i32(file, ckpt.pos_max);
+            write_chunk(file, ckpt.data_tgt);
+            write_chunk(file, ckpt.data_dft);
+            write_chunk(file, ckpt.data_spec);
+        }
+
+        if (!file) {
+            SRV_WRN("failed to write cold slot record: %s\n", entry.filepath.c_str());
+            return false;
+        }
+
+        SRV_INF("spilled prompt with %zu tokens to %s (cold id %d)\n",
+                state.prompt.tokens.size(), entry.filepath.c_str(), entry.id);
+
+        entry.prompt = state.prompt.tokens.clone();
+        cold_slots.push_back(std::move(entry));
+
+        cold_enforce_budget();
+
+        return true;
+    }
+
+    // offload a hot slot: RAM tier first, disk only when the entry is not RAM-eligible
     bool cold_offload_slot(server_slot & slot) {
         if (slot.prompt.tokens.empty()) {
             return false;
         }
 
-        std::vector<char> packed;
-        try {
-            packed = slot.prompt.tokens.serialize();
-        } catch (const std::exception & err) {
-            SLT_WRN(slot, "failed to serialize prompt for offload: %s\n", err.what());
-            return false;
+        const size_t size_tgt = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const size_t size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+
+        size_t ckpt_size = 0;
+        for (const auto & ckpt : slot.prompt.checkpoints) {
+            ckpt_size += ckpt.size();
         }
 
-        GGML_ASSERT(packed.size() % sizeof(llama_token) == 0);
-
-        cold_slot entry;
-        entry.id           = next_cold_id++;
-        entry.filepath     = params_base.slot_save_path + "cold_slot_" + std::to_string(entry.id) + ".bin";
-        entry.t_last_used  = slot.t_last_used;
-
-        const size_t nwrite = llama_state_seq_save_file(
-            ctx_tgt, entry.filepath.c_str(), slot.id,
-            reinterpret_cast<const llama_token *>(packed.data()), packed.size() / sizeof(llama_token));
-        if (nwrite == 0) {
-            SLT_WRN(slot, "failed to write cold slot state to %s\n", entry.filepath.c_str());
-            return false;
-        }
-
-        // append the checkpoint trailer so a SWA slot can resume from a checkpoint after restore
-        if (!slot.prompt.checkpoints.empty()) {
-            std::ofstream file(entry.filepath, std::ios::binary | std::ios::app);
-            if (!file) {
-                SLT_WRN(slot, "failed to append checkpoint trailer to %s\n", entry.filepath.c_str());
-            } else {
-                write_u32(file, (uint32_t) slot.prompt.checkpoints.size());
-                for (const auto & ckpt : slot.prompt.checkpoints) {
-                    write_i64(file, ckpt.n_tokens);
-                    write_i32(file, ckpt.id_task);
-                    write_i32(file, ckpt.pos_min);
-                    write_i32(file, ckpt.pos_max);
-                    write_chunk(file, ckpt.data_tgt);
-                    write_chunk(file, ckpt.data_dft);
-                    write_chunk(file, ckpt.data_spec);
-                }
-
-                if (file) {
-                    entry.ckpt_offset = nwrite;
-                } else {
-                    SLT_WRN(slot, "failed to write checkpoint trailer to %s\n", entry.filepath.c_str());
-                }
-            }
-        }
-
-        SLT_INF(slot, "offloaded prompt with %zu tokens to %s (cold id %d)\n",
-                slot.prompt.tokens.size(), entry.filepath.c_str(), entry.id);
-
-        entry.prompt = slot.prompt.tokens.clone();
-        cold_slots.push_back(std::move(entry));
-
-        if (prompt_cache) {
+        if (prompt_cache && prompt_cache->fits_in_ram(size_tgt + size_dft + ckpt_size)) {
             slot.prompt_save(*prompt_cache);
+            slot.prompt_clear();
+            return true;
         }
+
+        if (!cold_enabled()) {
+            return false;
+        }
+
+        server_prompt_cache_state state;
+        state.prompt.tokens = slot.prompt.tokens.clone();
+        state.prompt.checkpoints = slot.prompt.checkpoints;
+        state.data.main.resize(size_tgt);
+        state.data.drft.resize(size_dft);
+
+        llama_state_seq_get_data_ext(ctx_tgt, state.data.main.data(), size_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        if (size_dft > 0) {
+            llama_state_seq_get_data_ext(ctx_dft, state.data.drft.data(), size_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        }
+
+        const bool ok = cold_write_record(state);
         slot.prompt_clear();
 
-        cold_enforce_budget();
-
-        return true;
+        return ok;
     }
 
     // drop the oldest cold entries until the list fits the cold budget, deleting their files
@@ -1679,64 +1727,76 @@ private:
         }
     }
 
-    // load a cold entry's KV state into the target slot (remapped to its seq id)
+    // load a cold entry's record into the target slot (state chunks remapped to its seq id)
     // the caller is responsible for removing the entry from the list
     bool cold_restore_entry(server_slot & slot, const cold_slot & entry) {
         slot.prompt_clear();
 
         try {
-            size_t n_packed = 0;
-            size_t nread = llama_state_seq_load_file(ctx_tgt, entry.filepath.c_str(), slot.id, nullptr, 0, &n_packed);
-            if (nread == 0) {
-                throw std::runtime_error("no space in KV cache or invalid cold slot file");
+            std::ifstream file(entry.filepath, std::ios::binary);
+            if (!file) {
+                throw std::runtime_error("failed to open cold slot file for reading");
             }
 
+            const uint32_t n_tokens = read_u32(file);
             llama_tokens packed;
-            packed.resize(std::max<size_t>(1, n_packed));
-            nread = llama_state_seq_load_file(ctx_tgt, entry.filepath.c_str(), slot.id, packed.data(), packed.size(), &n_packed);
-            if (nread == 0) {
-                throw std::runtime_error("failed to read cold slot state");
+            packed.resize(n_tokens);
+            for (uint32_t i = 0; i < n_tokens; i++) {
+                packed[i] = read_i32(file);
             }
-            packed.resize(n_packed);
 
-            server_tokens restored = server_tokens::deserialize(packed, entry.prompt.has_mtmd);
+            std::vector<uint8_t> data_tgt, data_dft;
+            read_chunk(file, data_tgt);
+            read_chunk(file, data_dft);
 
-            if (restored.size() > (size_t) slot.n_ctx) {
+            if (data_tgt.empty()) {
+                throw std::runtime_error("corrupted cold slot record");
+            }
+
+            if (n_tokens > (uint32_t) slot.n_ctx) {
                 throw std::runtime_error("restored prompt does not fit in the slot context");
             }
+
+            const size_t nread = llama_state_seq_set_data_ext(ctx_tgt, data_tgt.data(), data_tgt.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+            if (nread != data_tgt.size()) {
+                throw std::runtime_error("failed to restore cold slot state");
+            }
+
+            if (!data_dft.empty()) {
+                GGML_ASSERT(ctx_dft);
+
+                const size_t n = llama_state_seq_set_data_ext(ctx_dft, data_dft.data(), data_dft.size(), slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                if (n != data_dft.size()) {
+                    throw std::runtime_error("failed to restore cold slot draft state");
+                }
+            }
+
+            server_tokens restored = server_tokens::deserialize(packed, entry.prompt.has_mtmd);
 
             if (!restored.validate(ctx_tgt)) {
                 throw std::runtime_error("invalid tokens in cold slot file");
             }
 
-            slot.prompt.clear();
             slot.prompt.tokens = std::move(restored);
 
-            if (entry.ckpt_offset > 0) {
-                std::ifstream file(entry.filepath, std::ios::binary);
-                if (!file) {
-                    throw std::runtime_error("failed to reopen cold slot file for checkpoints");
-                }
+            const uint32_t n_ckpt = read_u32(file);
+            for (uint32_t i = 0; i < n_ckpt; i++) {
+                common_prompt_checkpoint ckpt;
+                ckpt.n_tokens = read_i64(file);
+                ckpt.id_task  = read_i32(file);
+                ckpt.pos_min  = read_i32(file);
+                ckpt.pos_max  = read_i32(file);
+                read_chunk(file, ckpt.data_tgt);
+                read_chunk(file, ckpt.data_dft);
+                read_chunk(file, ckpt.data_spec);
+                slot.prompt.checkpoints.push_back(std::move(ckpt));
+            }
 
-                file.seekg(entry.ckpt_offset);
-                const uint32_t n_ckpt = read_u32(file);
+            if (!file) {
+                throw std::runtime_error("corrupted cold slot record");
+            }
 
-                for (uint32_t i = 0; i < n_ckpt; i++) {
-                    common_prompt_checkpoint ckpt;
-                    ckpt.n_tokens = read_i64(file);
-                    ckpt.id_task  = read_i32(file);
-                    ckpt.pos_min  = read_i32(file);
-                    ckpt.pos_max  = read_i32(file);
-                    read_chunk(file, ckpt.data_tgt);
-                    read_chunk(file, ckpt.data_dft);
-                    read_chunk(file, ckpt.data_spec);
-                    slot.prompt.checkpoints.push_back(std::move(ckpt));
-                }
-
-                if (!file) {
-                    throw std::runtime_error("corrupted checkpoint trailer in cold slot file");
-                }
-
+            if (n_ckpt > 0) {
                 SLT_INF(slot, "restored %u checkpoint(s) for cold id %d\n", n_ckpt, entry.id);
             }
         } catch (const std::exception & err) {
@@ -1749,6 +1809,36 @@ private:
                 entry.id, slot.prompt.tokens.size(), entry.filepath.c_str());
 
         return true;
+    }
+
+    // pick a target slot for a cache/cold restore: prefer an empty slot, else the LRU warm idle slot
+    server_slot * pick_target_slot(const server_task & task) {
+        if (task.id_slot != -1) {
+            server_slot * s = get_slot_by_id(task.id_slot);
+            if (s && !s->is_processing()) {
+                return s;
+            }
+        }
+
+        for (server_slot & slot : slots) {
+            if (!slot.is_processing() && slot.prompt.tokens.empty()) {
+                return &slot;
+            }
+        }
+
+        server_slot * target = nullptr;
+        int64_t t_last = -1;
+        for (server_slot & slot : slots) {
+            if (slot.is_processing()) {
+                continue;
+            }
+            if (!target || slot.t_last_used < t_last) {
+                t_last = slot.t_last_used;
+                target = &slot;
+            }
+        }
+
+        return target;
     }
 
     server_slot * get_available_slot(const server_task & task) {
@@ -1834,75 +1924,92 @@ private:
             }
         }
 
-        // no hot slot matched by similarity - scan cold (disk-offloaded) entries with
-        // the same LCP metric; a hot match above always takes precedence over a cold one
-        if (ret == nullptr && cold_on && slot_prompt_similarity != 0.0f) {
-            float f_sim_best = 0;
-            size_t idx_best = cold_slots.size();
+        // no hot slot matched by similarity - check the RAM tier first, then the cold tier:
+        // a cache hit is free, a cold hit costs a disk read
+        if (ret == nullptr && slot_prompt_similarity != 0.0f) {
+            bool cache_applied = false;
 
-            for (size_t i = 0; i < cold_slots.size(); i++) {
-                const size_t lcp_len = cold_slots[i].prompt.get_common_prefix(task.tokens);
-                const float f_sim_cur = float(lcp_len) / task.tokens.size();
-
-                SRV_TRC(" - checking cold sim = %.3f (%zu/%zu) > %.3f (cold id %d)\n",
-                        f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity, cold_slots[i].id);
-
-                if (f_sim_cur > f_sim_best && f_sim_cur > slot_prompt_similarity) {
-                    f_sim_best = f_sim_cur;
-                    idx_best = i;
-                }
-            }
-
-            if (idx_best < cold_slots.size()) {
-                // pick the target hot slot: prefer an empty slot, else the LRU warm idle slot
-                server_slot * target = nullptr;
-
-                for (server_slot & slot : slots) {
-                    if (!slot.is_processing() && slot.prompt.tokens.empty()) {
-                        target = &slot;
-                        break;
-                    }
-                }
-
-                if (target == nullptr) {
-                    int64_t t_last = -1;
-                    for (server_slot & slot : slots) {
-                        if (slot.is_processing()) {
-                            continue;
-                        }
-                        if (!target || slot.t_last_used < t_last) {
-                            t_last = slot.t_last_used;
-                            target = &slot;
-                        }
-                    }
-                }
+            if (prompt_cache) {
+                server_slot * target = pick_target_slot(task);
 
                 if (target != nullptr) {
-                    // move the entry out and erase it before the victim offload below,
-                    // so the budget math does not count the entry being consumed
-                    cold_slot entry = std::move(cold_slots[idx_best]);
-                    cold_slots.erase(cold_slots.begin() + idx_best);
-
-                    SLT_INF(*target, "selected cold id %d by LCP similarity, f_sim_best = %.3f (> %.3f thold)\n",
-                            entry.id, f_sim_best, slot_prompt_similarity);
-
-                    // the target may hold a warm prompt - offload it to disk first
+                    // the target may hold a warm prompt - offload it first (RAM tier when eligible)
+                    // do this before find_best so eviction during prompt_save cannot invalidate the iterator
                     if (!target->prompt.tokens.empty()) {
                         cold_offload_slot(*target);
                     }
 
-                    if (cold_restore_entry(*target, entry)) {
-                        // the entry is consumed by the restore - its file is no longer referenced
-                        std::error_code ec;
-                        std::filesystem::remove(entry.filepath, ec);
+                    server_prompt base;
+                    auto it_best = prompt_cache->find_best(base, task.tokens);
 
-                        // the restored KV is exactly the desired state - skip the RAM
-                        // cache update below (update_cache stays false on this path)
-                        ret = target;
-                    } else {
-                        SRV_WRN("%s", "cold slot match discarded, failed to load state\n");
-                        std::error_code ec;
-                        std::filesystem::remove(entry.filepath, ec);
+                    if (it_best != prompt_cache->states.end()) {
+                        const float f_sim_cur = float(it_best->prompt.tokens.get_common_prefix(task.tokens)) / task.tokens.size();
+
+                        SRV_INF("selected prompt cache entry by LCP similarity, f_sim_best = %.3f\n", f_sim_cur);
+
+                        cache_applied = prompt_cache->apply(*it_best, target->prompt, ctx_tgt, ctx_dft, target->id);
+                        prompt_cache->states.erase(it_best);
+
+                        if (cache_applied) {
+                            ret = target;
+                        }
+                    }
+                }
+            }
+
+            if (!cache_applied && cold_on) {
+                float f_sim_best = 0;
+                size_t idx_best = cold_slots.size();
+
+                for (size_t i = 0; i < cold_slots.size(); i++) {
+                    const size_t lcp_len = cold_slots[i].prompt.get_common_prefix(task.tokens);
+                    const float f_sim_cur = float(lcp_len) / task.tokens.size();
+
+                    SRV_TRC(" - checking cold sim = %.3f (%zu/%zu) > %.3f (cold id %d)\n",
+                            f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity, cold_slots[i].id);
+
+                    if (f_sim_cur > f_sim_best && f_sim_cur > slot_prompt_similarity) {
+                        f_sim_best = f_sim_cur;
+                        idx_best = i;
+                    }
+                }
+
+                if (idx_best < cold_slots.size()) {
+                    server_slot * target = pick_target_slot(task);
+
+                    if (target != nullptr) {
+                        // move the entry out and erase it before the victim offload below,
+                        // so the budget math does not count the entry being consumed
+                        cold_slot entry = std::move(cold_slots[idx_best]);
+                        cold_slots.erase(cold_slots.begin() + idx_best);
+
+                        SLT_INF(*target, "selected cold id %d by LCP similarity, f_sim_best = %.3f (> %.3f thold)\n",
+                                entry.id, f_sim_best, slot_prompt_similarity);
+
+                        // the target may hold a warm prompt - offload it first (RAM tier when eligible)
+                        if (!target->prompt.tokens.empty()) {
+                            cold_offload_slot(*target);
+                        }
+
+                        if (cold_restore_entry(*target, entry)) {
+                            // the entry is consumed by the restore - its file is no longer referenced
+                            std::error_code ec;
+                            std::filesystem::remove(entry.filepath, ec);
+
+                            // re-promote to the RAM tier when the entry is eligible
+                            if (prompt_cache && prompt_cache->fits_in_ram(
+                                    llama_state_seq_get_size_ext(ctx_tgt, target->id, LLAMA_STATE_SEQ_FLAGS_NONE)
+                                    + (ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, target->id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0)
+                                    + checkpoints_size(target->prompt))) {
+                                target->prompt_save(*prompt_cache);
+                            }
+
+                            ret = target;
+                        } else {
+                            SRV_WRN("%s", "cold slot match discarded, failed to load state\n");
+                            std::error_code ec;
+                            std::filesystem::remove(entry.filepath, ec);
+                        }
                     }
                 }
             }
