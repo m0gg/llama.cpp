@@ -633,6 +633,8 @@ struct common_params {
     int32_t kv_unified_per_slot = 0;     // max context per parallel slot; 0 = unset
     int32_t checkpoint_min_step = 8192;  // minimum spacing between context checkpoints
     int32_t cache_ram_mib       = 8192;  // -1 = no limit, 0 - disable, 1 = 1 MiB, etc.
+    float   cold_spill_fraction = 1.0f;  // entries above fraction * cache limit go directly to the cold tier
+    float   cold_spill_min_fraction = 0.0f; // experimental: evicted entries below fraction * cache limit are dropped instead of spilled to disk
 
     std::string public_path   = "";                                                                         // NOLINT
     std::string api_prefix    = "";                                                                         // NOLINT

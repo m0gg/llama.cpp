@@ -7,6 +7,7 @@
 #include <unordered_set>
 #include <list>
 #include <map>
+#include <functional>
 
 // TODO: prevent including the whole server-common.h as we only use server_tokens
 #include "server-common.h"
@@ -598,6 +599,9 @@ struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
 
+    // entry above the spill threshold: caller fills data, then hands the state to the cold tier
+    bool pending_spill = false;
+
     size_t size() const {
         size_t res = data.size();
 
@@ -623,15 +627,39 @@ struct server_prompt_cache {
     // in tokens, 0 = no limit
     size_t limit_tokens = 0;
 
+    // fraction of limit_size above which entries go directly to the cold tier
+    float spill_fraction = 1.0f;
+
+    // fraction of limit_size below which evicted entries are dropped instead of spilled
+    float min_fraction = 0.0f;
+
+    // called on eviction/spill; returns true if the entry was stored in the cold tier
+    std::function<bool(const server_prompt_cache_state &)> on_evict;
+
+    bool fits_in_ram(size_t state_size) const {
+        return limit_size == 0 || state_size <= size_t(limit_size * spill_fraction);
+    }
+
     size_t size() const;
 
     size_t n_tokens() const;
 
-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+    std::list<server_prompt_cache_state>::iterator alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
+    // returns true if a cache entry was found and applied to the slot
     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
 
+    std::list<server_prompt_cache_state>::iterator find_best(const server_prompt & base, const server_tokens & tokens_new);
+
+    bool apply(server_prompt_cache_state & state, server_prompt & prompt, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+
+    // write a pending_spill entry to the cold tier and remove it from the cache
+    void spill(std::list<server_prompt_cache_state>::iterator it);
+
     void update();
+
+private:
+    bool evict_front();
 };
 
 // used exclusively by router mode
